@@ -55,6 +55,113 @@ We provide the training code along with a sample dataloader to help you quickly 
     torchrun --standalone --nnodes 1 --nproc-per-node X vla-scripts/train_asyncvla.py  --vla_path ./AsyncVLA_release --dataset_name asyncvla --wandb_entity "X"   --wandb_project "asyncvla" --grad_accumulation_steps X
     ```
     
+### SO-101 manipulation (LeRobot)
+
+This fork adds a manipulation training + inference path that finetunes the OpenVLA-7B base (the AsyncVLA backbone) on a HuggingFace LeRobot v3.0 dataset such as [`k1000dai/so101_pick_candy_clean`](https://huggingface.co/datasets/k1000dai/so101_pick_candy_clean).
+
+It reuses the AsyncVLA model surface (vision + LLM + proprio projector + L1 regression action head) and strips out the navigation-only multi-modal trajectory losses and the MBRA edge adapter — so no `Learning-to-Drive-Anywhere-with-MBRA` checkout is required.
+
+#### 1. Environment
+
+The original navigation environment doesn't load `k1000dai/so101_pick_candy_clean` (LeRobot v3) out of the box. A known-good combo:
+
+```
+python 3.11
+torch 2.2.0  torchvision 0.17.1                # original pins also work
+transformers 4.45.x  peft 0.11.1  accelerate>=0.30
+huggingface_hub>=0.24  datasets>=3.0,<4.0  pyarrow<19  draccus>=0.10
+timm>=0.9.10,<1.0.0                            # hard checked in modeling_prismatic.py
+tensorflow==2.15.0  tensorflow_graphics==2021.12.3  dlimp@git+https://github.com/moojink/dlimp_openvla
+numpy<2                                         # tensorflow 2.15 needs this; lerobot can bump it
+lerobot==0.4.4                                  # reads LeRobot v3.0 datasets
+av  imageio[ffmpeg]                             # pyav video backend, avoids torchcodec/libavutil
+```
+
+`flash-attn` is **not required** — `train_so101.py --attn_implementation eager` (default) runs on any CUDA GPU. Install flash-attn if you want extra throughput on A100/H100.
+
+#### 2. Configure
+
+Edit `config_nav/so101_config.yaml` to point at your dataset and cameras. Defaults match `k1000dai/so101_pick_candy_clean`:
+
+```yaml
+dataset:
+  repo_id: k1000dai/so101_pick_candy_clean
+  video_backend: pyav
+cameras:
+  main_camera: observation.images.top
+  secondary_camera: observation.images.wrist
+modality_id: 5                # pose + ego-image (proprio token active)
+default_prompt: "pick up candy and put it in the bowl"
+```
+
+The platform constants (`ACTION_DIM=6`, `POSE_DIM=6`) are selected by an env var — export it once per shell, before any Python in this repo runs:
+
+```
+export ASYNCVLA_PLATFORM=so101
+```
+
+#### 3. Train
+
+Single-GPU LoRA finetune of OpenVLA-7B:
+
+```bash
+ASYNCVLA_PLATFORM=so101 PYTHONPATH=$PWD \
+torchrun --standalone --nnodes 1 --nproc-per-node 1 \
+    vla-scripts/train_so101.py \
+    --vla_path openvla/openvla-7b \
+    --dataset_repo_id k1000dai/so101_pick_candy_clean \
+    --max_steps 10000 --batch_size 1 --lora_rank 32 \
+    --lr_warmup_steps 200 --num_steps_before_decay 8000 \
+    --save_freq 2000 --num_workers 4 \
+    --wandb_log_freq 25 \
+    --wandb_entity your-entity --wandb_project asyncvla-so101 \
+    --run_id_note long-run
+```
+
+Reference run on a single RTX A6000 / eager attention: **10 000 steps in ≈ 4 h 10 m**, action L2 from `0.62 → 0.001` (best), `0.027` running mean over the last 100 steps. Checkpoints land in `runs_so101/<run_id>--<step>_chkpt/` and contain:
+
+- `lora_adapter/` (PEFT-style: `adapter_config.json`, `adapter_model.safetensors`) — LoRA delta on top of OpenVLA-7B
+- `pose_projector--<step>_checkpoint.pt`
+- `action_head--<step>_checkpoint.pt`
+- HF processor/tokenizer files
+
+To resume from an AsyncVLA checkpoint instead of OpenVLA, pass `--vla_path ./AsyncVLA_release --resume True --resume_step 750000`; the script will also pick up matching `pose_projector` / `action_head` checkpoints when present.
+
+#### 4. Inference
+
+`inference/run_so101.py` loads a saved checkpoint, pulls one frame from the LeRobot dataset, runs a forward pass, and prints the predicted 8-step joint-position chunk next to the ground truth:
+
+```bash
+ASYNCVLA_PLATFORM=so101 PYTHONPATH=$PWD \
+python inference/run_so101.py \
+    --checkpoint_dir runs_so101/openvla-7b+so101+b1+lr-5e-05+lora-r32--long-run--10000_chkpt \
+    --step 10000 \
+    --frame_index 0
+```
+
+Example output (frame 0 of the candy-pick dataset):
+
+```
+proprio (deg)   [   0.,  -104.17,   95.47,  -99.69,   -0.66,  28.67]
+prediction      ~[-1.5,  -108.,    90.,    -93.,    -1.1,  29.5 ]   (8 steps)
+ground truth     [-0.22, -109.93,  96.00, -100.12,  -0.83, 28.63]   (all 8 identical)
+L1=0.0591  L2=0.0044  (normalised; matches training-time L2)
+```
+
+To plug your own observation, replace the `SO101_Dataset` block at the bottom of `run_so101.py` with whatever produces `(main_image, secondary_image, state_norm, instruction)` from your robot. The `build_inputs(...)` + `predict_action_chunk(...)` helpers do the rest. Denormalise the model output with `dataset.action_low` / `dataset.action_high` (these are saved with the checkpoint in `lora_adapter/README.md` for the dataset you trained on, or recompute them from `LeRobotDatasetMetadata.stats`).
+
+#### 5. Summary of fork changes
+
+| File | Status | Purpose |
+| --- | --- | --- |
+| `prismatic/vla/constants.py` | modified | New `ASYNCVLA_PLATFORM` env var selects between `omnivla` (4-D nav action) and `so101` (6-D arm action). Navigation defaults unchanged. |
+| `prismatic/vla/datasets/so101_dataset.py` | **new** | `SO101_Dataset` wraps `LeRobotDataset` (v3.0 ready), normalises action/state via q01–q99 stats, builds the AsyncVLA prompt + action chunk, returns batches matching the existing collator contract. Defaults to `video_backend="pyav"` so no system FFmpeg is needed. |
+| `prismatic/util/data_utils.py` | modified | Adds `PaddedCollatorForActionPrediction_SO101`, a slim collator that drops the navigation-only goal-image / trajectory bookkeeping and forwards the proprio state as `goal_pose`. |
+| `config_nav/so101_config.yaml` | **new** | Dataset config (repo_id, camera keys, action chunk size, modality id, default prompt, video backend). |
+| `vla-scripts/train_so101.py` | **new** | LoRA finetune entrypoint. Uses OpenVLA base + `ProprioProjector` + `L1RegressionActionHead_idcat`, L1 loss on the action chunk, `attn_implementation=eager` default, automatic pad-token fallback, optional LR warmup, periodic checkpoints, per-step loss prints. |
+| `inference/run_so101.py` | **new** | End-to-end inference demo: load LoRA+pose_projector+action_head, build a single-frame batch, run forward, print predicted vs GT joint targets. |
+| `README.md` | modified | This section. |
+
 ### Acknowledgement
 We implement our ideas and design choices on top of the pretrained checkpoints. Our work builds upon the [OpenVLA-OFT](https://openvla-oft.github.io/), [OmniVLA](https://github.com/NHirose/OmniVLA) and [ViNT](https://github.com/robodhruv/visualnav-transformer) codebases, with additional code added to create AsyncVLA. As such, our implementation leverages many components of these codebases. We sincerely appreciate the effort and contributions of the OpenVLA-OFT, OmniVLA and ViNT team!
 

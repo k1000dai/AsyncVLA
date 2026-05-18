@@ -13,6 +13,10 @@ vla-scripts/train_asyncvla_.py
 config_nav/mbra_and_dataset_config_.yaml
 visualization/
 runs/
+runs_so101/
+logs/
+.venv/
+.claude/
 # Ignore all __pycache__ directories everywhere
 **/__pycache__/
 # Ignore all wandb directories everywhere

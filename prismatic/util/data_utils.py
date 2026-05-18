@@ -194,6 +194,68 @@ class PaddedCollatorForActionPrediction_Nav_MMN:
         return output
         
 @dataclass
+class PaddedCollatorForActionPrediction_SO101:
+    """Collator for arm-manipulation training (e.g. SO-101).
+
+    Mirrors :class:`PaddedCollatorForActionPrediction_Nav_MMN` but drops the
+    navigation-only goal-image and trajectory bookkeeping. ``goal_pose`` is
+    repurposed as the proprio state and ``modality_id`` is fixed by the dataset
+    (``5`` = ego-image + pose) so the existing VLA forward hooks keep working.
+    """
+
+    model_max_length: int
+    pad_token_id: int
+    padding_side: str = "right"
+    pixel_values_dtype: torch.dtype = torch.float32
+    num_img: int = 2
+
+    def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        input_ids = [instance["input_ids"] for instance in instances]
+        labels = [instance["labels"] for instance in instances]
+        pixel_values = [instance["pixel_values"] for instance in instances]
+        pixel_values_goal = [instance["pixel_values_goal"] for instance in instances]
+
+        assert all(pv is not None for pv in pixel_values), "Invalid VLA Example with `pixel_values = None`!"
+        assert isinstance(pixel_values[0], torch.Tensor), (
+            f"Unsupported `pixel_values` type = {type(pixel_values[0])}"
+        )
+
+        pixel_values = torch.cat(
+            (torch.stack(pixel_values), torch.stack(pixel_values_goal)), dim=1
+        )
+
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
+        labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        input_ids = input_ids[:, : self.model_max_length]
+        labels = labels[:, : self.model_max_length]
+
+        attention_mask = input_ids.ne(self.pad_token_id)
+        attention_mask_label = labels.ne(IGNORE_INDEX)
+
+        actions = torch.stack([torch.as_tensor(np.copy(inst["actions"])) for inst in instances])
+        proprio = torch.stack([torch.as_tensor(np.copy(inst["proprio"])) for inst in instances])
+        modality_id = torch.as_tensor([inst["modality_id"] for inst in instances])
+
+        output = dict(
+            pixel_values=pixel_values,
+            proprio=proprio,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            attention_mask_label=attention_mask_label,
+            labels=labels,
+            actions=actions,
+            goal_pose=proprio,
+            goal_mask_select=modality_id,
+            modality_id=modality_id,
+        )
+        if "dataset_name" in instances[0]:
+            output["dataset_names"] = [inst["dataset_name"] for inst in instances]
+        if "lan_prompt" in instances[0]:
+            output["lan_prompts"] = [inst["lan_prompt"] for inst in instances]
+        return output
+
+
+@dataclass
 class PaddedCollatorForActionPrediction:
     model_max_length: int
     pad_token_id: int

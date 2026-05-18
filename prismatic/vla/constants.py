@@ -1,10 +1,11 @@
 """
 Important constants for VLA training and evaluation.
 
-Attempts to automatically identify the correct constants to set based on the Python command used to launch
-training or evaluation. If it is unclear, defaults to using the LIBERO simulation benchmark constants.
+The active set of constants is selected by the ``ASYNCVLA_PLATFORM`` environment
+variable so the same codebase can drive both the original navigation pipeline
+(``omnivla``) and arm-manipulation finetuning (``so101``).
 """
-import sys
+import os
 from enum import Enum
 
 # Llama 2 token constants
@@ -30,7 +31,26 @@ OMNIVLA_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
-constants = OMNIVLA_CONSTANTS    
+# SO-101 (LeRobot, 6-DOF arm + gripper). Joints + gripper packed into a 6-D action.
+SO101_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 8,
+    "ACTION_DIM": 6,
+    "POSE_DIM": 6,
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
+}
+
+PLATFORM_REGISTRY = {
+    "omnivla": OMNIVLA_CONSTANTS,
+    "so101": SO101_CONSTANTS,
+}
+
+ROBOT_PLATFORM = os.environ.get("ASYNCVLA_PLATFORM", "omnivla").lower()
+if ROBOT_PLATFORM not in PLATFORM_REGISTRY:
+    raise ValueError(
+        f"Unknown ASYNCVLA_PLATFORM='{ROBOT_PLATFORM}'. "
+        f"Supported: {sorted(PLATFORM_REGISTRY)}"
+    )
+constants = PLATFORM_REGISTRY[ROBOT_PLATFORM]
 
 # Assign constants to global variables
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]
@@ -39,9 +59,9 @@ POSE_DIM = constants["POSE_DIM"]
 ACTION_PROPRIO_NORMALIZATION_TYPE = constants["ACTION_PROPRIO_NORMALIZATION_TYPE"]
 
 # Print which robot platform constants are being used (for debugging)
-print(f"Using OmniVLA constants:")
+print(f"Using {ROBOT_PLATFORM} constants:")
 print(f"  NUM_ACTIONS_CHUNK = {NUM_ACTIONS_CHUNK}")
 print(f"  ACTION_DIM = {ACTION_DIM}")
 print(f"  POSE_DIM = {POSE_DIM}")
 print(f"  ACTION_PROPRIO_NORMALIZATION_TYPE = {ACTION_PROPRIO_NORMALIZATION_TYPE}")
-print("If needed, manually set the correct constants in `prismatic/vla/constants.py`!")
+print("Override by exporting ASYNCVLA_PLATFORM (e.g. `export ASYNCVLA_PLATFORM=so101`).")

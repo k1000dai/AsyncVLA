@@ -1,0 +1,39 @@
+# SO-101 manipulation dataset configuration for AsyncVLA / OmniVLA.
+# Loaded by vla-scripts/train_so101.py.
+
+dataset:
+  repo_id: k1000dai/so101_pick_candy_clean   # HuggingFace LeRobot dataset
+  root: null                                  # Local cache override (null => default HF cache)
+  split: train                                # LeRobot only ships `train` for most datasets
+  fps: null                                   # If null, taken from dataset metadata
+  episodes: null                              # Optional list of episode indices to keep
+  video_backend: pyav                         # "pyav" avoids torchcodec/libavutil system FFmpeg deps
+
+# Camera keys used as the main and "wrist/secondary" view. Order matters – the
+# first entry is fed as `pixel_values`, the second as `pixel_values_goal` to
+# match the AsyncVLA model's two-image input contract. If a dataset only has
+# one camera, leave `secondary_camera` null and the main view will be duplicated.
+cameras:
+  main_camera: observation.images.top      # 480x848 third-person view
+  secondary_camera: observation.images.wrist  # 480x640 wrist view
+
+# Action / state keys inside the LeRobot dataset.
+features:
+  state: observation.state
+  action: action
+  task: task
+
+# Action chunking (matches NUM_ACTIONS_CHUNK in constants.py).
+action_chunk_size: 8
+
+# Image preprocessing target for the small MBRA-style buffers that the
+# AsyncVLA collator still expects (only used to satisfy the model API). The
+# actual VLA visual input is resized by the processor.
+image_size: [96, 96]
+
+# Modality id forwarded to the VLA. 5 = "pose + ego-image", which keeps the
+# proprio token enabled and a single ego image active in the attention mask.
+modality_id: 5
+
+# Default language prompt to use when an example has no `task` field.
+default_prompt: "pick up candy and put it in the bowl"
