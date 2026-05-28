@@ -14,6 +14,7 @@ config_nav/mbra_and_dataset_config_.yaml
 visualization/
 runs/
 runs_so101/
+runs_so101_async/
 logs/
 .venv/
 .claude/

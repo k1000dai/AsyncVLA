@@ -137,6 +137,7 @@ class SO101_Dataset(Dataset):
         default_prompt: str = "Perform the demonstrated manipulation task.",
         predict_stop_token: bool = True,
         video_backend: Optional[str] = "pyav",
+        past_offset: int = 4,
     ) -> None:
         super().__init__()
         if action_chunk_size != NUM_ACTIONS_CHUNK:
@@ -146,6 +147,7 @@ class SO101_Dataset(Dataset):
             )
 
         self.dataset = _load_lerobot_dataset(repo_id, root, episodes, video_backend=video_backend)
+        self.past_offset = max(int(past_offset), 0)
         self.action_tokenizer = action_tokenizer
         self.base_tokenizer = base_tokenizer
         self.image_transform = image_transform
@@ -207,6 +209,12 @@ class SO101_Dataset(Dataset):
             if start <= index < end:
                 return end
         return len(self.dataset)
+
+    def _episode_start(self, index: int) -> int:
+        for start, end in self._episode_bounds:
+            if start <= index < end:
+                return start
+        return 0
 
     def _resize_norm(self, image: torch.Tensor) -> torch.Tensor:
         return TF.resize(image, list(self.image_size))
@@ -280,9 +288,22 @@ class SO101_Dataset(Dataset):
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        # MBRA-style image buffers are not used in manipulation training but the
-        # collator still expects the keys.
-        small_image = self._resize_norm(main_image)
+        # Small image buffers fed to the AsyncVLA Edge_adapter (EfficientNet
+        # input at 96x96). ``c_image`` is the current main-camera frame,
+        # ``p_image`` is the same camera ``past_offset`` frames earlier (clamped
+        # to the episode start). The secondary (wrist) camera is exposed via
+        # ``pixel_values_goal`` for the VLA's two-image input contract.
+        small_current = self._resize_norm(main_image)
+        if self.past_offset > 0:
+            past_index = max(self._episode_start(index), index - self.past_offset)
+            if past_index == index:
+                small_past = small_current.clone()
+            else:
+                past_sample = self.dataset[past_index]
+                past_main = _to_chw_tensor(past_sample[self.main_camera])
+                small_past = self._resize_norm(past_main)
+        else:
+            small_past = small_current.clone()
         small_secondary = self._resize_norm(secondary_image)
 
         action_select_mask = torch.tensor(1.0)
@@ -300,9 +321,9 @@ class SO101_Dataset(Dataset):
             proprio=proprio,
             goal_pose=proprio,
             obj_pose_norm=obj_pose_norm,
-            p_image=small_secondary,
-            c_image=small_image,
-            cur_image=small_image,
+            p_image=small_past,
+            c_image=small_current,
+            cur_image=small_current,
             goal_image_8=small_secondary,
             temp_dist=torch.tensor(0.0),
             img_PIL=current_image_pil,

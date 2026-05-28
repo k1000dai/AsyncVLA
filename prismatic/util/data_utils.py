@@ -236,6 +236,16 @@ class PaddedCollatorForActionPrediction_SO101:
         proprio = torch.stack([torch.as_tensor(np.copy(inst["proprio"])) for inst in instances])
         modality_id = torch.as_tensor([inst["modality_id"] for inst in instances])
 
+        # Small 96x96 image buffers consumed by the AsyncVLA Edge_adapter
+        # (``c_image`` = current main camera, ``p_image`` = past main camera).
+        # Optional — only present when the dataset exposes them.
+        c_image = None
+        p_image = None
+        if "c_image" in instances[0]:
+            c_image = torch.stack([torch.as_tensor(np.copy(inst["c_image"])) for inst in instances])
+        if "p_image" in instances[0]:
+            p_image = torch.stack([torch.as_tensor(np.copy(inst["p_image"])) for inst in instances])
+
         output = dict(
             pixel_values=pixel_values,
             proprio=proprio,
@@ -248,6 +258,10 @@ class PaddedCollatorForActionPrediction_SO101:
             goal_mask_select=modality_id,
             modality_id=modality_id,
         )
+        if c_image is not None:
+            output["c_image"] = c_image
+        if p_image is not None:
+            output["p_image"] = p_image
         if "dataset_name" in instances[0]:
             output["dataset_names"] = [inst["dataset_name"] for inst in instances]
         if "lan_prompt" in instances[0]:

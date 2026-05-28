@@ -3,7 +3,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Dict, Optional, Tuple
 from efficientnet_pytorch import EfficientNet
-from vint_train.models.vint.self_attention import MultiLayerDecoder, MultiLayerDecoder_idcat, MultiLayerDecoder_trans
+try:
+    # Navigation pipeline ships vint_train via the
+    # Learning-to-Drive-Anywhere-with-MBRA checkout.
+    from vint_train.models.vint.self_attention import (  # type: ignore[import-not-found]
+        MultiLayerDecoder,
+        MultiLayerDecoder_idcat,
+        MultiLayerDecoder_trans,
+    )
+except ImportError:
+    # SO-101 / standalone path: vendored minimal Transformer encoder.
+    from prismatic.models.transformer_decoder import (
+        MultiLayerDecoder,
+        MultiLayerDecoder_idcat,
+        MultiLayerDecoder_trans,
+    )
 from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, STOP_INDEX
 
 class Edge_adapter(nn.Module):
@@ -41,14 +55,17 @@ class Edge_adapter(nn.Module):
             ff_dim_factor=mha_ff_dim_factor,
         )
 
+        # Final action chunk size: NUM_ACTIONS_CHUNK * ACTION_DIM (platform-aware
+        # via prismatic.vla.constants). Navigation keeps its 8x4 layout, SO-101
+        # picks up 8x6 automatically when ASYNCVLA_PLATFORM=so101.
         self.action_predictor = nn.Sequential(
-            nn.Linear(self.obs_encoding_size, 256),   
-            nn.ReLU(),            
-            nn.Linear(256, 128),  
-            nn.ReLU(),            
-            nn.Linear(128, 64),  
-            nn.ReLU(),            
-            nn.Linear(64, 8 * 4),         
+            nn.Linear(self.obs_encoding_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, NUM_ACTIONS_CHUNK * ACTION_DIM),
         )
     def forward(self, obs_img: torch.tensor, past_img: torch.tensor, vla_feature: torch.tensor) -> torch.Tensor:
 
@@ -60,14 +77,14 @@ class Edge_adapter(nn.Module):
         if self.cat_encoder._global_params.include_top:
             cat_encoding = cat_encoding.flatten(start_dim=1)
             cat_encoding = self.cat_encoder._dropout(cat_encoding)
-        cat_encoding = self.compress_cat_enc(cat_encoding)            
+        cat_encoding = self.compress_cat_enc(cat_encoding)
 
         obs_encoding = self.obs_encoder.extract_features(obs_img)
         obs_encoding = self.obs_encoder._avg_pooling(obs_encoding)
         if self.obs_encoder._global_params.include_top:
             obs_encoding = obs_encoding.flatten(start_dim=1)
             obs_encoding = self.obs_encoder._dropout(obs_encoding)
-        obs_encoding = self.compress_obs_enc(obs_encoding)            
+        obs_encoding = self.compress_obs_enc(obs_encoding)
 
         tokens = torch.cat((vla_feature, obs_encoding.unsqueeze(1), cat_encoding.unsqueeze(1)), dim=1)
         tokens = self.decoder(tokens)[:,-2:-1,:]
@@ -75,7 +92,7 @@ class Edge_adapter(nn.Module):
         x = tokens.reshape(tokens.shape[0], -1)
         action_pred = self.action_predictor(x).reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
 
-        return action_pred 
+        return action_pred
 
 class Edge_adapter_v0(nn.Module):
     def __init__(
@@ -113,13 +130,13 @@ class Edge_adapter_v0(nn.Module):
         )
 
         self.action_predictor = nn.Sequential(
-            nn.Linear(self.obs_encoding_size+1, 256),   
-            nn.ReLU(),            
-            nn.Linear(256, 128),  
-            nn.ReLU(),            
-            nn.Linear(128, 64),  
-            nn.ReLU(),            
-            nn.Linear(64, 8 * 4),         
+            nn.Linear(self.obs_encoding_size+1, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, NUM_ACTIONS_CHUNK * ACTION_DIM),
         )
     def forward(self, obs_img: torch.tensor, past_img: torch.tensor, vla_feature: torch.tensor, taskid: torch.tensor) -> torch.Tensor:
 

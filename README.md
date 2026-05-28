@@ -127,7 +127,58 @@ Reference run on a single RTX A6000 / eager attention: **10 000 steps in ≈ 4 h
 
 To resume from an AsyncVLA checkpoint instead of OpenVLA, pass `--vla_path ./AsyncVLA_release --resume True --resume_step 750000`; the script will also pick up matching `pose_projector` / `action_head` checkpoints when present.
 
-#### 4. Inference
+#### 4. Full AsyncVLA two-stage pipeline (recommended)
+
+The "Async" in AsyncVLA refers to a two-stage architecture: a heavyweight **Base VLA** (vision + LLM + LoRA + proprio projector) and a lightweight **Edge adapter** (`shead`) that consumes a projected representation of the base's action tokens. At deployment the base can run at low frequency on a workstation while the edge adapter runs at high frequency on the robot edge controller.
+
+`vla-scripts/train_so101_async.py` ports this two-stage training to manipulation. The action chunk is supervised in joint space using the same loss recipe as the navigation script, adapted to 6-DOF joint targets:
+
+```
+predicted_djoints = shead(c_image, p_image, action_proj(vla_hidden, modality_id))
+predicted_joints  = cumsum(predicted_djoints)   # delta -> absolute, like delta_to_pose
+
+L  = 0.5  * MSE(predicted_joints,  actions)        # absolute target
+   + 7.5  * MSE(predicted_djoints, joints_to_delta(actions))   # smoothness via deltas
+   + 0.1  * MSE(predicted_joints,  [proprio, predicted_joints[:-1]])  # consecutive-frame jump
+```
+
+Launch command (single A6000, eager attention):
+
+```bash
+ASYNCVLA_PLATFORM=so101 PYTHONPATH=$PWD \
+torchrun --standalone --nnodes 1 --nproc-per-node 1 \
+    vla-scripts/train_so101_async.py \
+    --vla_path openvla/openvla-7b \
+    --dataset_repo_id k1000dai/so101_pick_candy_clean \
+    --max_steps 10000 --batch_size 1 --lora_rank 32 \
+    --lr_warmup_steps 200 --num_steps_before_decay 8000 \
+    --save_freq 2000 --num_workers 4 \
+    --wandb_log_freq 25 \
+    --wandb_entity your-entity --wandb_project asyncvla-so101 \
+    --run_id_note async
+```
+
+Verified smoke: 10 steps × LoRA r=8 produces 246.9 M trainable params (VLA LoRA 27.7 M + pose_projector 16.8 M + action_proj 138.5 M + shead 63.9 M), forward + backward closes cleanly, all four module checkpoints land under `runs_so101_async/<run_id>--<step>_chkpt/` (`lora_adapter/`, `pose_projector--N.pt`, `action_proj--N.pt`, `shead--N.pt`).
+
+Inference uses the matching two-stage script:
+
+```bash
+ASYNCVLA_PLATFORM=so101 PYTHONPATH=$PWD \
+python inference/run_so101_async.py \
+    --checkpoint_dir runs_so101_async/<run_id>--<step>_chkpt \
+    --step <step> \
+    --frame_index 0
+```
+
+Notes:
+
+- `vint_train` (the MBRA repo) is **not required** — `prismatic/models/transformer_decoder.py` provides a vendored `MultiLayerDecoder_trans` (learned positional embedding + standard `nn.TransformerEncoder`) that `prismatic/models/small_head.py` falls back to when `vint_train` is not importable. If you do have the MBRA checkout on `sys.path`, the original implementation is used unchanged so navigation checkpoints stay compatible.
+- `Edge_adapter`'s final layer now sizes itself by `NUM_ACTIONS_CHUNK * ACTION_DIM`, so SO-101 (8×6) and navigation (8×4) both work from the same class without code forks.
+- The `SO101_Dataset` now actually loads a past frame from the same episode (defaults to `past_offset=4`, clamped to the episode start) instead of repurposing the wrist camera as "past".
+
+#### 5. Single-stage alternative
+
+`vla-scripts/train_so101.py` is a simpler OpenVLA-OFT-style entrypoint kept around as a reference / minimal alternative. It trains only OpenVLA base + LoRA + `pose_projector` + `L1RegressionActionHead_idcat` (no Edge adapter). Use this if you want to ablate the two-stage architecture or save the action_proj / shead memory budget.
 
 `inference/run_so101.py` loads a saved checkpoint, pulls one frame from the LeRobot dataset, runs a forward pass, and prints the predicted 8-step joint-position chunk next to the ground truth:
 
@@ -150,7 +201,7 @@ L1=0.0591  L2=0.0044  (normalised; matches training-time L2)
 
 To plug your own observation, replace the `SO101_Dataset` block at the bottom of `run_so101.py` with whatever produces `(main_image, secondary_image, state_norm, instruction)` from your robot. The `build_inputs(...)` + `predict_action_chunk(...)` helpers do the rest. Denormalise the model output with `dataset.action_low` / `dataset.action_high` (these are saved with the checkpoint in `lora_adapter/README.md` for the dataset you trained on, or recompute them from `LeRobotDatasetMetadata.stats`).
 
-#### 5. Real-robot inference (SO-101 hardware)
+#### 6. Real-robot inference (SO-101 hardware)
 
 `inference/run_so101_robot.py` runs the same model on a live SO-101 follower arm via [`lerobot`](https://github.com/huggingface/lerobot). It opens the cameras, reads the 6-DOF joint state, predicts an 8-step action chunk, denormalises it to degrees, and streams the joint targets back to the arm at the dataset fps (30 Hz on `k1000dai/so101_pick_candy_clean`). A `--max_relative_target` per-step clamp is on by default for safety.
 
@@ -208,16 +259,20 @@ Useful flags:
 
 **Safety:** keep the laptop's e-stop / power cut within reach the first time you run unclamped, especially with `--exec_horizon 8`. The candy-pick checkpoint reaches ~0.027 normalised L2 on the demo distribution but has no guarantees outside it. Start with `--dry_run`, then a small `--exec_horizon` + low `--max_relative_target` before opening it up.
 
-#### 6. Summary of fork changes
+#### 7. Summary of fork changes
 
 | File | Status | Purpose |
 | --- | --- | --- |
-| `prismatic/vla/constants.py` | modified | New `ASYNCVLA_PLATFORM` env var selects between `omnivla` (4-D nav action) and `so101` (6-D arm action). Navigation defaults unchanged. |
-| `prismatic/vla/datasets/so101_dataset.py` | **new** | `SO101_Dataset` wraps `LeRobotDataset` (v3.0 ready), normalises action/state via q01–q99 stats, builds the AsyncVLA prompt + action chunk, returns batches matching the existing collator contract. Defaults to `video_backend="pyav"` so no system FFmpeg is needed. |
-| `prismatic/util/data_utils.py` | modified | Adds `PaddedCollatorForActionPrediction_SO101`, a slim collator that drops the navigation-only goal-image / trajectory bookkeeping and forwards the proprio state as `goal_pose`. |
-| `config_nav/so101_config.yaml` | **new** | Dataset config (repo_id, camera keys, action chunk size, modality id, default prompt, video backend). |
-| `vla-scripts/train_so101.py` | **new** | LoRA finetune entrypoint. Uses OpenVLA base + `ProprioProjector` + `L1RegressionActionHead_idcat`, L1 loss on the action chunk, `attn_implementation=eager` default, automatic pad-token fallback, optional LR warmup, periodic checkpoints, per-step loss prints. |
-| `inference/run_so101.py` | **new** | End-to-end inference demo: load LoRA+pose_projector+action_head, build a single-frame batch, run forward, print predicted vs GT joint targets. |
+| `prismatic/vla/constants.py` | modified | `ASYNCVLA_PLATFORM` env var selects between `omnivla` (4-D nav action) and `so101` (6-D arm action). Navigation defaults unchanged. |
+| `prismatic/vla/datasets/so101_dataset.py` | **new** | `SO101_Dataset` wraps `LeRobotDataset` (v3.0 ready), normalises action/state via q01-q99 stats, builds the AsyncVLA prompt + action chunk, loads a real past frame for the Edge adapter via `past_offset`. Defaults to `video_backend="pyav"`. |
+| `prismatic/util/data_utils.py` | modified | Adds `PaddedCollatorForActionPrediction_SO101` and forwards `c_image` / `p_image` to the batch so the Edge adapter receives them. |
+| `prismatic/models/small_head.py` | modified | `Edge_adapter` and `Edge_adapter_v0` final layer now sizes by `NUM_ACTIONS_CHUNK * ACTION_DIM`. Import of `vint_train` is wrapped in a try/except that falls back to the vendored transformer below — navigation users with MBRA on `sys.path` get the original implementation unchanged. |
+| `prismatic/models/transformer_decoder.py` | **new** | Vendored `MultiLayerDecoder_trans` (learned positional embedding + `nn.TransformerEncoder`) so the SO-101 pipeline is self-contained and does not require the MBRA checkout. |
+| `config_nav/so101_config.yaml` | **new** | Dataset config (repo_id, camera keys, modality_id, default prompt, video backend). |
+| `vla-scripts/train_so101_async.py` | **new** | **Full AsyncVLA two-stage finetune**: VLA + LoRA + `ProprioProjector` + `Proj_Actiontokens` + `Edge_adapter`. Joint-space delta + smoothness loss matching the navigation recipe. |
+| `vla-scripts/train_so101.py` | **new** | Single-stage OpenVLA-OFT-style alternative (no Edge adapter). |
+| `inference/run_so101_async.py` | **new** | End-to-end two-stage inference: LoRA-merged VLA -> action_proj -> Edge_adapter -> joint chunk. |
+| `inference/run_so101.py` | **new** | Inference for the single-stage script above. |
 | `inference/run_so101_robot.py` | **new** | Real-robot control loop using `lerobot` `SO101Follower` + OpenCV wrist cam + Intel RealSense top cam. Reuses `load_inference_modules` / `build_inputs` / `predict_action_chunk` from `run_so101.py`. |
 | `scripts/save_so101_norm_stats.py` | **new** | One-shot script that dumps the dataset's q01/q99 action and state bounds (plus joint names and fps) to `<checkpoint>/so101_norm_stats.json` so robot inference doesn't need the dataset at runtime. |
 | `README.md` | modified | This section. |
